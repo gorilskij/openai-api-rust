@@ -4,7 +4,10 @@ extern crate derive_builder;
 
 use thiserror::Error;
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(feature = "async")]
+mod async_client;
 
 #[allow(clippy::default_trait_access)]
 pub mod api {
@@ -205,6 +208,7 @@ pub mod api {
 
 /// This library's main `Error` type.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// An error returned by the API itself
     #[error("API returned an Error: {}", .0.message)]
@@ -212,13 +216,17 @@ pub enum Error {
     /// An error the client discovers before talking to the API
     #[error("Bad arguments: {0}")]
     BadArguments(String),
+    #[error("JSON error")]
+    JsonError(#[from] serde_json::Error),
+    #[error("URL parse error")]
+    UrlParseError(#[from] url::ParseError),
     /// Network / protocol related errors
     #[cfg(feature = "async")]
     #[error("Error at the protocol level: {0}")]
-    AsyncProtocol(surf::Error),
+    AsyncProtocol(#[from] reqwest::Error),
     #[cfg(feature = "sync")]
     #[error("Error at the protocol level, sync client")]
-    SyncProtocol(ureq::Error),
+    SyncProtocol(#[from] ureq::Error),
 }
 
 impl From<api::ErrorMessage> for Error {
@@ -234,68 +242,10 @@ impl From<String> for Error {
 }
 
 #[cfg(feature = "async")]
-impl From<surf::Error> for Error {
-    fn from(e: surf::Error) -> Self {
-        Error::AsyncProtocol(e)
+impl From<reqwest::header::InvalidHeaderValue> for Error {
+    fn from(err: reqwest::header::InvalidHeaderValue) -> Self {
+        Error::BadArguments(format!("{}", err))
     }
-}
-
-#[cfg(feature = "sync")]
-impl From<ureq::Error> for Error {
-    fn from(e: ureq::Error) -> Self {
-        Error::SyncProtocol(e)
-    }
-}
-
-/// Authentication middleware
-#[cfg(feature = "async")]
-struct BearerToken {
-    token: String,
-}
-
-#[cfg(feature = "async")]
-impl std::fmt::Debug for BearerToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Get the first few characters to help debug, but not accidentally log key
-        write!(
-            f,
-            r#"Bearer {{ token: "{}" }}"#,
-            self.token.get(0..8).ok_or(std::fmt::Error)?
-        )
-    }
-}
-
-#[cfg(feature = "async")]
-impl BearerToken {
-    fn new(token: &str) -> Self {
-        Self {
-            token: String::from(token),
-        }
-    }
-}
-
-#[cfg(feature = "async")]
-#[surf::utils::async_trait]
-impl surf::middleware::Middleware for BearerToken {
-    async fn handle(
-        &self,
-        mut req: surf::Request,
-        client: surf::Client,
-        next: surf::middleware::Next<'_>,
-    ) -> surf::Result<surf::Response> {
-        log::debug!("Request: {:?}", req);
-        req.insert_header("Authorization", format!("Bearer {}", self.token));
-        let response: surf::Response = next.run(req, client).await?;
-        log::debug!("Response: {:?}", response);
-        Ok(response)
-    }
-}
-
-#[cfg(feature = "async")]
-fn async_client(token: &str, base_url: &str) -> surf::Client {
-    let mut async_client = surf::client();
-    async_client.set_base_url(surf::Url::parse(base_url).expect("Static string should parse"));
-    async_client.with(BearerToken::new(token))
 }
 
 #[cfg(feature = "sync")]
@@ -305,59 +255,37 @@ fn sync_client(token: &str) -> ureq::Agent {
 
 /// Client object. Must be constructed to talk to the API.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct Client {
+    base_url: String,
     #[cfg(feature = "async")]
-    async_client: surf::Client,
+    async_client: async_client::AsyncClient,
     #[cfg(feature = "sync")]
     sync_client: ureq::Agent,
-    #[cfg(feature = "sync")]
-    base_url: String,
 }
 
 impl Client {
     // Creates a new `Client` given an api token
-    #[must_use]
-    pub fn new(token: &str) -> Self {
+    pub fn new(token: &str) -> Result<Self> {
         let base_url: String = "https://api.openai.com/v1/".into();
-        Self {
+        Ok(Self {
             #[cfg(feature = "async")]
-            async_client: async_client(token, &base_url),
+            async_client: async_client::AsyncClient::new(token, &base_url)?,
             #[cfg(feature = "sync")]
             sync_client: sync_client(token),
-            #[cfg(feature = "sync")]
             base_url,
-        }
+        })
     }
 
     // Allow setting the api root in the tests
     #[cfg(test)]
-    fn set_api_root(mut self, base_url: &str) -> Self {
+    fn set_api_root(mut self, base_url: &str) -> Result<Self> {
         #[cfg(feature = "async")]
         {
-            self.async_client.set_base_url(
-                surf::Url::parse(base_url).expect("static URL expected to parse correctly"),
-            );
+            self.async_client.set_base_url(base_url)?;
         }
-        #[cfg(feature = "sync")]
-        {
-            self.base_url = String::from(base_url);
-        }
-        self
-    }
-
-    /// Private helper for making gets
-    #[cfg(feature = "async")]
-    async fn get<T>(&self, endpoint: &str) -> Result<T>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let mut response = self.async_client.get(endpoint).await?;
-        if let surf::StatusCode::Ok = response.status() {
-            Ok(response.body_json::<T>().await?)
-        } else {
-            let err = response.body_json::<api::ErrorWrapper>().await?.error;
-            Err(Error::Api(err))
-        }
+        self.base_url = base_url.into();
+        Ok(self)
     }
 
     #[cfg(feature = "sync")]
@@ -390,7 +318,10 @@ impl Client {
     /// - `Error::APIError` if the server returns an error
     #[cfg(feature = "async")]
     pub async fn engines(&self) -> Result<Vec<api::EngineInfo>> {
-        self.get("engines").await.map(|r: api::Container<_>| r.data)
+        self.async_client
+            .get("engines")
+            .await
+            .map(|r: api::Container<_>| r.data)
     }
 
     /// Lists the currently available engines.
@@ -412,37 +343,12 @@ impl Client {
     /// - `Error::APIError` if the server returns an error
     #[cfg(feature = "async")]
     pub async fn engine(&self, engine: &str) -> Result<api::EngineInfo> {
-        self.get(&format!("engines/{}", engine)).await
+        self.async_client.get(&format!("engines/{}", engine)).await
     }
 
     #[cfg(feature = "sync")]
     pub fn engine_sync(&self, engine: &str) -> Result<api::EngineInfo> {
         self.get_sync(&format!("engines/{}", engine))
-    }
-
-    // Private helper to generate post requests. Needs to be a bit more flexible than
-    // get because it should support SSE eventually
-    #[cfg(feature = "async")]
-    async fn post<B, R>(&self, endpoint: &str, body: B) -> Result<R>
-    where
-        B: serde::ser::Serialize,
-        R: serde::de::DeserializeOwned,
-    {
-        let mut response = self
-            .async_client
-            .post(endpoint)
-            .body(surf::Body::from_json(&body)?)
-            .await?;
-        match response.status() {
-            surf::StatusCode::Ok => Ok(response.body_json::<R>().await?),
-            _ => Err(Error::Api(
-                response
-                    .body_json::<api::ErrorWrapper>()
-                    .await
-                    .expect("The API has returned something funky")
-                    .error,
-            )),
-        }
     }
 
     #[cfg(feature = "sync")]
@@ -481,6 +387,7 @@ impl Client {
     ) -> Result<api::Completion> {
         let args = prompt.into();
         Ok(self
+            .async_client
             .post(&format!("engines/{}/completions", args.engine), args)
             .await?)
     }
@@ -537,7 +444,10 @@ mod unit {
 
     fn mocked_client() -> Client {
         let _ = env_logger::builder().is_test(true).try_init();
-        Client::new("bogus").set_api_root(&format!("{}/", mockito::server_url()))
+        Client::new("bogus")
+            .expect("client creation succeeded")
+            .set_api_root(&format!("{}/", mockito::server_url()))
+            .expect("setting API root succeeded")
     }
 
     #[test]
@@ -782,7 +692,7 @@ mod integration {
         let sk = std::env::var("OPENAI_SK").expect(
             "To run integration tests, you must put set the OPENAI_SK env var to your api token",
         );
-        Client::new(&sk)
+        Client::new(&sk).expect("client creation succeeded")
     }
 
     async_test!(can_get_engines_async, {

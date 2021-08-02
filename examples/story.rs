@@ -2,13 +2,14 @@
 use openai_api::Client;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_token = std::env::var("OPENAI_SK").unwrap();
-    let client = Client::new(&api_token);
+    let client = Client::new(&api_token)?;
     let prompt = String::from("Once upon a time,");
     println!(
         "{}{}",
         prompt,
         client.complete_prompt(prompt.as_str()).await.unwrap()
     );
+    Ok(())
 }
