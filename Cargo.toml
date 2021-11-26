@@ -11,7 +11,7 @@ keywords = ["openai", "gpt3"]
 categories = ["api-bindings", "asynchronous"]
 
 [features]
-default = ["sync", "async"]
+default = ["async"]
 sync = ["ureq"]
 async = ["reqwest"]
 

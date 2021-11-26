@@ -1,4 +1,4 @@
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Response, Url};
 
 #[derive(Clone, Debug)]
@@ -13,6 +13,7 @@ impl AsyncClient {
         let mut token = HeaderValue::from_str(&format!("Bearer {}", token))?;
         token.set_sensitive(true);
         header_map.insert(AUTHORIZATION, token);
+        header_map.insert(CONTENT_TYPE, HeaderValue::from_str("application/json")?);
         let client = reqwest::ClientBuilder::new()
             .default_headers(header_map)
             .build()?;
